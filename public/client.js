@@ -1,35 +1,38 @@
-// client.js — Race UI + interpolation; widescreen; spectators; room browser
+// client.js — Player-follow camera, fixed course, interpolation, spectators & room browser.
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
+
 const statusEl = document.getElementById('status');
-const progressEl = document.getElementById('progress');
-const finishEl  = document.getElementById('finish');
 const roomInput = document.getElementById('room');
 const nameInput = document.getElementById('name');
 const joinBtn = document.getElementById('joinBtn');
 const readyBtn = document.getElementById('readyBtn');
 const gameStateEl = document.getElementById('gameState');
 const countdownEl = document.getElementById('countdown');
+const progressEl = document.getElementById('progress');
+const finishEl  = document.getElementById('finish');
 const refreshRoomsBtn = document.getElementById('refreshRooms');
 const roomsListEl = document.getElementById('roomsList');
 
 let ws, meId = null;
 
-// Snapshot buffer for interpolation
-const buffer = [];                 // recent server states
-const INTERP_DELAY = 120;          // ms
-let serverOffset = 0;              // serverTime - clientNow estimate
+// Interpolation buffer
+const buffer = [];
+const INTERP_DELAY = 120;  // ms
+let serverOffset = 0;
 
-function resizeCanvasForDPR() {
+// DPR scaling
+function sizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   canvas.width = 1920 * dpr;
   canvas.height = 1080 * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-resizeCanvasForDPR();
-addEventListener('resize', resizeCanvasForDPR);
+sizeCanvas();
+addEventListener('resize', sizeCanvas);
 
-// ---- Room browser UI ----
+// -------- Room browser --------
 async function loadRooms() {
   try {
     roomsListEl.textContent = 'Loading…';
@@ -67,7 +70,7 @@ refreshRoomsBtn.addEventListener('click', loadRooms);
 setInterval(loadRooms, 5000);
 loadRooms();
 
-// ---- Networking ----
+// -------- Networking --------
 function connect(roomId, name) {
   if (ws) ws.close();
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -89,30 +92,41 @@ function connect(roomId, name) {
 
       gameStateEl.textContent = msg.state;
       if (msg.countdownEndsAt) {
-        const sec = Math.max(0, Math.ceil((msg.countdownEndsAt - now - serverOffset)/1000));
+        const sec = Math.max(0, Math.ceil((msg.countdownEndsAt - now - serverOffset) / 1000));
         countdownEl.textContent = (msg.state === 'countdown') ? sec : '—';
       } else countdownEl.textContent = '—';
 
-      finishEl.textContent = msg.finishPipes ?? '—';
+      if (msg.course) {
+        finishEl.textContent = msg.course.finishPipes ?? '—';
+      }
+
       const me = msg.players.find(p => p.id === meId);
       progressEl.textContent = me ? (me.progress ?? 0) : 0;
-
-      // Ready enabled only in lobby for non-spectators
       readyBtn.disabled = !(msg.state === 'lobby' && me && !me.spectator);
       readyBtn.textContent = (me && me.ready) ? 'Ready ✓' : 'Ready';
     }
   };
   ws.onclose = () => { statusEl.textContent = 'disconnected'; };
 }
-
 joinBtn.addEventListener('click', () => connect(roomInput.value.trim() || 'lobby', nameInput.value.trim() || 'Player'));
 readyBtn.addEventListener('click', () => {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ready', ready: true }));
 });
 
-// Interpolation helpers
+// Input
+function flap() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'flap' })); }
+function restart() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'restart' })); }
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); flap(); }
+  if (e.key.toLowerCase() === 'r') { restart(); }
+});
+canvas.addEventListener('mousedown', flap);
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); flap(); }, { passive: false });
+
+// -------- Interpolation & camera --------
 function lerp(a, b, t) { return a + (b - a) * t; }
-function getRenderState() {
+
+function getInterpolatedState() {
   if (buffer.length < 1) return null;
   const renderTime = Date.now() + serverOffset - INTERP_DELAY;
 
@@ -125,96 +139,103 @@ function getRenderState() {
   const span = Math.max(1, b.t - a.t);
   const t = Math.min(1, Math.max(0, (renderTime - a.t) / span));
 
-  const interpPlayers = b.players.map(pb => {
+  // Interpolate players (x, y, vy)
+  const players = b.players.map(pb => {
     const pa = a.players.find(p => p.id === pb.id) || pb;
-    return { ...pb, y: lerp(pa.y, pb.y, t), vy: lerp(pa.vy ?? 0, pb.vy ?? 0, t) };
+    return {
+      ...pb,
+      x: lerp(pa.x, pb.x, t),
+      y: lerp(pa.y, pb.y, t),
+      vy: lerp(pa.vy ?? 0, pb.vy ?? 0, t)
+    };
   });
 
-  const interpPipes = b.pipes.map(pb => {
-    const pa = a.pipes.find(p => p.id === pb.id) || pb;
-    return { ...pb, x: lerp(pa.x, pb.x, t) };
-  });
-
+  // Course/pipes are static; carry from latest 'b'
   return {
-    w: b.w, h: b.h,
     state: b.state,
     countdownEndsAt: b.countdownEndsAt,
     winnerId: b.winnerId,
-    finishPipes: b.finishPipes,
-    constants: b.constants,
-    players: interpPlayers,
-    pipes: interpPipes
+    view: b.view,
+    course: b.course,
+    players
   };
 }
 
-// Input
-function flap() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'flap' })); }
-function restart() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'restart' })); }
-addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { e.preventDefault(); flap(); }
-  if (e.key.toLowerCase() === 'r') { restart(); }
-});
-canvas.addEventListener('mousedown', flap);
-canvas.addEventListener('touchstart', (e) => { e.preventDefault(); flap(); }, { passive: false });
+function getCameraX(s) {
+  // Follow me; if spectator or missing, follow the leader
+  const me = s.players.find(p => p.id === meId);
+  const target = (me && !me.spectator) ? me : s.players
+    .filter(p => !p.spectator)
+    .sort((p1, p2) => p2.x - p1.x)[0];
+  return target ? target.x : 0;
+}
 
-// Drawing (widescreen 1920×1080 logical)
+// -------- Rendering --------
 function draw() {
-  const s = getRenderState();
+  const s = getInterpolatedState();
   const w = 1920, h = 1080;
   ctx.clearRect(0,0,w,h);
 
-  // background
+  // Background & ground
   ctx.fillStyle = '#10141b';
   ctx.fillRect(0,0,w,h);
   ctx.fillStyle = '#232a33';
-  ctx.fillRect(0,h-90,w,90);
+  ctx.fillRect(0, h - (s?.view?.groundH ?? 100), w, (s?.view?.groundH ?? 100));
 
-  if (s) {
-    const { players, pipes, constants, finishPipes } = s;
-    const { BIRD_X, BIRD_RADIUS, PIPE_HALF_W } = constants;
+  if (s && s.course) {
+    const camX = getCameraX(s);
+    const half = w / 2;
 
-    // finish line banner (visual target reference on screen edge)
+    // Helper to convert world->screen X
+    const sx = (worldX) => (worldX - camX) + half;
+
+    // Finish line (static world position)
+    const finishSX = sx(s.course.finishX);
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 4;
     ctx.setLineDash([16,16]);
     ctx.beginPath();
-    ctx.moveTo(w - 100, 0);
-    ctx.lineTo(w - 100, h - 90);
+    ctx.moveTo(finishSX, 0);
+    ctx.lineTo(finishSX, h - s.view.groundH);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // pipes
+    // Pipes (fixed world x)
     ctx.fillStyle = '#49c36b';
-    pipes.forEach(p => {
-      ctx.fillRect(p.x - PIPE_HALF_W, 0, PIPE_HALF_W*2, p.top);
-      ctx.fillRect(p.x - PIPE_HALF_W, p.bottom, PIPE_HALF_W*2, h - p.bottom - 90);
+    s.course.pipes.forEach(p => {
+      const px = sx(p.x);
+      // Cull if off-screen
+      if (px < -200 || px > w + 200) return;
+      ctx.fillRect(px - s.course.pipeHalfW, 0, s.course.pipeHalfW*2, p.top);
+      ctx.fillRect(px - s.course.pipeHalfW, p.bottom, s.course.pipeHalfW*2, h - p.bottom - s.view.groundH);
     });
 
-    // players (no spectators drawn)
-    players.filter(p => !p.spectator).forEach(p => {
+    // Players (skip spectators)
+    s.players.filter(p => !p.spectator).forEach(p => {
+      const px = sx(p.x);
+      if (px < -100 || px > w + 100) return;
       const isMe = p.id === meId;
       ctx.beginPath();
       ctx.fillStyle = isMe ? '#ffd166' : '#6aa0ff';
-      ctx.arc(BIRD_X, p.y, BIRD_RADIUS + 2, 0, Math.PI * 2);
+      ctx.arc(px, p.y, 16, 0, Math.PI * 2);
       ctx.fill();
 
       // name
       ctx.fillStyle = '#fff';
       ctx.font = '18px system-ui, sans-serif';
-      const tag = `${p.name}`;
-      ctx.fillText(tag, BIRD_X - 30, p.y - (BIRD_RADIUS + 10));
+      ctx.fillText(p.name, px - 30, p.y - 22);
 
-      // progress bar under each player
-      const ratio = (p.progress || 0) / (finishPipes || 1);
-      const barW = 160, barH = 10, bx = BIRD_X - barW/2, by = p.y + BIRD_RADIUS + 14;
-      ctx.fillStyle = '#2a2e36';
-      ctx.fillRect(bx, by, barW, barH);
+      // progress bar
+      const barW = 200, barH = 12, bx = px - barW/2, by = p.y + 24;
+      const ratio = (p.progress || 0) / (s.course.finishPipes || 1);
+      ctx.fillStyle = '#2a2e36'; ctx.fillRect(bx, by, barW, barH);
       ctx.fillStyle = isMe ? '#b3ffd2' : '#9ab7ff';
       ctx.fillRect(bx, by, Math.max(0, Math.min(barW, barW * ratio)), barH);
       ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(bx, by, barW, barH);
     });
 
-    // overlays
+    // Overlays
+    ctx.fillStyle = '#ffffff';
     if (s.state !== 'playing') {
       ctx.fillStyle = 'rgba(0,0,0,0.35)';
       ctx.fillRect(0,0,w,h);
@@ -239,5 +260,11 @@ function draw() {
 }
 draw();
 
-// Auto-connect default
+// -------- Auto-connect --------
+function flap() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'flap' })); }
+function restart() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'restart' })); }
+addEventListener('keydown', (e) => { if (e.code === 'Space') { e.preventDefault(); flap(); } if (e.key.toLowerCase() === 'r') { restart(); } });
+canvas.addEventListener('mousedown', flap);
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); flap(); }, { passive: false });
+
 connect('lobby', 'Player');
