@@ -257,7 +257,10 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (msg.type === 'ready' && room.state === 'lobby') p.ready = true;
+    if (msg.type === 'ready' && room.state === 'lobby') {
+      p.ready = true;
+    }
+    
     if (msg.type === 'flap' && room.state === 'playing' && !p.spectator) {
       const now = Date.now();
       if (now - p.lastFlapAt >= MIN_FLAP_INTERVAL_MS) {
@@ -265,12 +268,19 @@ wss.on('connection', (ws) => {
         p.lastFlapAt = now;
       }
     }
+    
+    // Fixed: Restart now starts countdown directly from gameover state
     if (msg.type === 'restart' && room.state === 'gameover') {
-      // Only allow restart from gameover state, and only if enough players
-      if (canStart(room)) {
+      // Only allow restart if enough players are ready/available
+      const activePlayers = [...room.players.values()].filter(player => !player.spectator);
+      if (activePlayers.length >= MIN_PLAYERS) {
         startCountdown(room);
+      } else {
+        // Not enough players - go back to lobby instead
+        resetToLobby(room);
       }
     }
+  });
   
   ws.on('close', () => leaveRoom(ws));
   
