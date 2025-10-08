@@ -135,16 +135,24 @@ function stepRoom(room) {
     if (!room.winnerId && p.progress >= FINISH_PIPES && p.x >= room.course.finishX) {
       room.winnerId = id;
       room.state = 'gameover';
-      setTimeout(() => resetToLobby(room), 3500);
+      const originalRoomState = room.state; // Capture current state
+      setTimeout(() => {
+        // Check if room still exists and is still in gameover state
+        if (rooms.has(room) && room.state === 'gameover') {
+          resetToLobby(room);
+        }
+      }, 3500);
+      break; // Important: break to avoid multiple winners in same tick
     }
   }
 }
 
 function snapshot(room) {
-  const players = [...room.players.entries()].map(([id, p]) => ({
-    id, name: p.name, x: p.x, y: p.y, vy: p.vy,
-    progress: p.progress, ready: p.ready, spectator: p.spectator
-  }));
+  const players = [...room.players.entries()].map(([id, p]) => {
+    // Omit internal _scored property from snapshot
+    const { _scored, ...playerData } = p;
+    return { id, ...playerData };
+  });
 
   return {
     type: 'state',
@@ -164,7 +172,7 @@ function joinRoom(ws, roomId, name) {
   const joiningDuringRound = room.state === 'playing';
   const id = uuidv4();
   room.players.set(id, {
-    name: name.slice(0, 16),
+    name: (name || 'Player').slice(0, 16), // Fixed: handle undefined name
     x: 80, y: VIEW_H / 2, vy: 0,
     ready: false,
     spectator: joiningDuringRound,
@@ -174,27 +182,80 @@ function joinRoom(ws, roomId, name) {
   });
   ws._roomId = roomId;
   ws._playerId = id;
-  ws.send(JSON.stringify({ type: 'joined', id, roomId }));
-  ws.send(JSON.stringify(snapshot(room)));
+  
+  // Fixed: Added error handling for message sending
+  try {
+    ws.send(JSON.stringify({ type: 'joined', id, roomId }));
+    ws.send(JSON.stringify(snapshot(room)));
+  } catch (error) {
+    console.error('Error sending message to client:', error);
+  }
 }
 
 function leaveRoom(ws) {
-  const room = rooms.get(ws._roomId);
-  if (!room) return;
-  room.players.delete(ws._playerId);
-  if (room.players.size === 0) rooms.delete(ws._roomId);
+  const roomId = ws._roomId;
+  if (!roomId || !rooms.has(roomId)) return;
+  
+  const room = rooms.get(roomId);
+  const playerId = ws._playerId;
+  
+  if (playerId && room.players.has(playerId)) {
+    room.players.delete(playerId);
+  }
+  
+  if (room.players.size === 0) {
+    rooms.delete(roomId);
+  }
 }
 
 // === WebSocket Handling ===
 wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
-    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.type === 'join') return joinRoom(ws, msg.roomId || 'lobby', msg.name || 'Player');
+    let msg;
+    try { 
+      msg = JSON.parse(raw.toString());
+    } catch (error) { 
+      // Fixed: Send error response back to client
+      try {
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON message' }));
+      } catch (sendError) {
+        console.error('Error sending error message:', sendError);
+      }
+      return; 
+    }
+    
+    if (msg.type === 'join') {
+      // Fixed: Added input validation
+      if (!msg.name || typeof msg.name !== 'string') {
+        try {
+          ws.send(JSON.stringify({ type: 'error', message: 'Invalid player name' }));
+        } catch (sendError) {
+          console.error('Error sending error message:', sendError);
+        }
+        return;
+      }
+      return joinRoom(ws, msg.roomId || 'lobby', msg.name);
+    }
 
     const room = rooms.get(ws._roomId);
-    if (!room) return;
+    if (!room) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not in a room' }));
+      } catch (sendError) {
+        console.error('Error sending error message:', sendError);
+      }
+      return;
+    }
+    
     const p = room.players.get(ws._playerId);
-    if (!p) return;
+    if (!p) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', message: 'Player not found' }));
+      } catch (sendError) {
+        console.error('Error sending error message:', sendError);
+      }
+      return;
+    }
 
     if (msg.type === 'ready' && room.state === 'lobby') p.ready = true;
     if (msg.type === 'flap' && room.state === 'playing' && !p.spectator) {
@@ -204,9 +265,16 @@ wss.on('connection', (ws) => {
         p.lastFlapAt = now;
       }
     }
-    if (msg.type === 'restart') resetToLobby(room);
+    if (msg.type === 'restart' && room.state === 'gameover') resetToLobby(room);
   });
+  
   ws.on('close', () => leaveRoom(ws));
+  
+  // Fixed: Added error event handler
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+    leaveRoom(ws);
+  });
 });
 
 // === GAME LOOP ===
@@ -216,11 +284,25 @@ setInterval(() => {
 
 setInterval(() => {
   const payloads = new Map();
-  for (const [id, room] of rooms.entries()) payloads.set(id, JSON.stringify(snapshot(room)));
+  for (const [id, room] of rooms.entries()) {
+    try {
+      payloads.set(id, JSON.stringify(snapshot(room)));
+    } catch (error) {
+      console.error('Error serializing snapshot for room', id, error);
+    }
+  }
+  
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
     const snap = payloads.get(client._roomId);
-    if (snap) client.send(snap);
+    if (snap) {
+      try {
+        client.send(snap);
+      } catch (error) {
+        console.error('Error sending snapshot to client:', error);
+        // Don't leaveRoom here as it might be a temporary issue
+      }
+    }
   }
 }, 1000 / SNAP_RATE);
 
