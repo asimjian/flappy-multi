@@ -15,6 +15,7 @@ let ws, meId = null;
 let buffer = [];
 let serverOffset = 0;
 const INTERP_DELAY = 120;
+let currentState = null; // Track current game state for click handling
 
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
@@ -64,6 +65,7 @@ function connect(room, name) {
       
       if (msg.type !== 'state') return;
 
+      currentState = msg; // Store for click handling
       const now = Date.now();
       const measured = msg.serverTime - now;
       serverOffset = serverOffset ? (0.8 * serverOffset + 0.2 * measured) : measured;
@@ -147,12 +149,55 @@ window.addEventListener('keydown', e => {
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault();
-  flap();
+  
+  // Check if click is on "Play Again" button
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const canvasX = (e.clientX - rect.left) * scaleX;
+  const canvasY = (e.clientY - rect.top) * scaleY;
+  
+  // Play Again button coordinates (centered)
+  const buttonX = 1920 / 2 - 100;
+  const buttonY = 1080 / 2 + 50;
+  const buttonWidth = 200;
+  const buttonHeight = 60;
+  
+  if (currentState && currentState.state === 'gameover' &&
+      canvasX >= buttonX && canvasX <= buttonX + buttonWidth &&
+      canvasY >= buttonY && canvasY <= buttonY + buttonHeight) {
+    restart();
+  } else {
+    flap();
+  }
 });
 
 canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
-  flap();
+  
+  // Handle touch for "Play Again" button
+  if (e.touches.length > 0) {
+    const touch = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const canvasX = (touch.clientX - rect.left) * scaleX;
+    const canvasY = (touch.clientY - rect.top) * scaleY;
+    
+    // Play Again button coordinates (centered)
+    const buttonX = 1920 / 2 - 100;
+    const buttonY = 1080 / 2 + 50;
+    const buttonWidth = 200;
+    const buttonHeight = 60;
+    
+    if (currentState && currentState.state === 'gameover' &&
+        canvasX >= buttonX && canvasX <= buttonX + buttonWidth &&
+        canvasY >= buttonY && canvasY <= buttonY + buttonHeight) {
+      restart();
+    } else {
+      flap();
+    }
+  }
 }, { passive: false });
 
 // Interpolation utilities
@@ -318,6 +363,13 @@ function draw() {
     } else if (s.state === 'gameover') {
       const winner = s.players.find(p => p.id === s.winnerId);
       msg = winner ? `${winner.name} wins!` : 'Round Over';
+      
+      // Draw "Play Again" button
+      ctx.fillStyle = '#4CAF50';
+      ctx.fillRect(w/2 - 100, h/2 + 50, 200, 60);
+      ctx.fillStyle = '#fff';
+      ctx.font = '24px sans-serif';
+      ctx.fillText('Play Again', w/2, h/2 + 85);
     }
     
     ctx.fillText(msg, w / 2, h * 0.42);

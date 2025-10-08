@@ -265,8 +265,12 @@ wss.on('connection', (ws) => {
         p.lastFlapAt = now;
       }
     }
-    if (msg.type === 'restart' && room.state === 'gameover') resetToLobby(room);
-  });
+    if (msg.type === 'restart' && room.state === 'gameover') {
+      // Only allow restart from gameover state, and only if enough players
+      if (canStart(room)) {
+        startCountdown(room);
+      }
+    }
   
   ws.on('close', () => leaveRoom(ws));
   
