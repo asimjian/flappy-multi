@@ -1,8 +1,9 @@
-// client.js
+// client.js — Race UI + interpolation; widescreen; spectators; room browser
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
-const scoreEl  = document.getElementById('score');
+const progressEl = document.getElementById('progress');
+const finishEl  = document.getElementById('finish');
 const roomInput = document.getElementById('room');
 const nameInput = document.getElementById('name');
 const joinBtn = document.getElementById('joinBtn');
@@ -15,19 +16,18 @@ const roomsListEl = document.getElementById('roomsList');
 let ws, meId = null;
 
 // Snapshot buffer for interpolation
-const buffer = [];
-const INTERP_DELAY = 120;     // ms
-let serverOffset = 0;
+const buffer = [];                 // recent server states
+const INTERP_DELAY = 120;          // ms
+let serverOffset = 0;              // serverTime - clientNow estimate
 
-function resizeCanvas() {
+function resizeCanvasForDPR() {
   const dpr = window.devicePixelRatio || 1;
-  const logicalW = 480, logicalH = 800;
-  canvas.width = logicalW * dpr;
-  canvas.height = logicalH * dpr;
+  canvas.width = 1920 * dpr;
+  canvas.height = 1080 * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-resizeCanvas();
-addEventListener('resize', resizeCanvas);
+resizeCanvasForDPR();
+addEventListener('resize', resizeCanvasForDPR);
 
 // ---- Room browser UI ----
 async function loadRooms() {
@@ -40,7 +40,7 @@ async function loadRooms() {
       ...data.rooms.map(r => rowItem(r))
     ];
     roomsListEl.replaceChildren(...rows.flat());
-  } catch (e) {
+  } catch {
     roomsListEl.textContent = 'Failed to load rooms';
   }
 }
@@ -60,7 +60,6 @@ function rowItem(r) {
   const ready = document.createElement('div'); ready.textContent = `${r.ready}/${r.players}`;
   const join = document.createElement('button'); join.className = 'room-join'; join.textContent = 'Join';
   join.onclick = () => { roomInput.value = r.id; connect(r.id, nameInput.value.trim() || 'Player'); };
-  // Use display: contents for grid rows
   const wrapper = document.createElement('div'); wrapper.className = 'room-item';
   return [name, state, players, specs, ready, (wrapper.appendChild(join), join)];
 }
@@ -94,9 +93,11 @@ function connect(roomId, name) {
         countdownEl.textContent = (msg.state === 'countdown') ? sec : '—';
       } else countdownEl.textContent = '—';
 
+      finishEl.textContent = msg.finishPipes ?? '—';
       const me = msg.players.find(p => p.id === meId);
-      scoreEl.textContent = me ? me.score : 0;
-      // Ready is only meaningful in lobby & if not spectator
+      progressEl.textContent = me ? (me.progress ?? 0) : 0;
+
+      // Ready enabled only in lobby for non-spectators
       readyBtn.disabled = !(msg.state === 'lobby' && me && !me.spectator);
       readyBtn.textContent = (me && me.ready) ? 'Ready ✓' : 'Ready';
     }
@@ -138,6 +139,8 @@ function getRenderState() {
     w: b.w, h: b.h,
     state: b.state,
     countdownEndsAt: b.countdownEndsAt,
+    winnerId: b.winnerId,
+    finishPipes: b.finishPipes,
     constants: b.constants,
     players: interpPlayers,
     pipes: interpPipes
@@ -154,26 +157,37 @@ addEventListener('keydown', (e) => {
 canvas.addEventListener('mousedown', flap);
 canvas.addEventListener('touchstart', (e) => { e.preventDefault(); flap(); }, { passive: false });
 
-// Rendering (skip spectators)
+// Drawing (widescreen 1920×1080 logical)
 function draw() {
   const s = getRenderState();
-  const w = 480, h = 800;
+  const w = 1920, h = 1080;
   ctx.clearRect(0,0,w,h);
 
-  ctx.fillStyle = '#11151b';
+  // background
+  ctx.fillStyle = '#10141b';
   ctx.fillRect(0,0,w,h);
-  ctx.fillStyle = '#2b2f38';
-  ctx.fillRect(0,h-60,w,60);
+  ctx.fillStyle = '#232a33';
+  ctx.fillRect(0,h-90,w,90);
 
   if (s) {
-    const { players, pipes, constants } = s;
-    const { BIRD_X, BIRD_RADIUS } = constants;
+    const { players, pipes, constants, finishPipes } = s;
+    const { BIRD_X, BIRD_RADIUS, PIPE_HALF_W } = constants;
+
+    // finish line banner (visual target reference on screen edge)
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 4;
+    ctx.setLineDash([16,16]);
+    ctx.beginPath();
+    ctx.moveTo(w - 100, 0);
+    ctx.lineTo(w - 100, h - 90);
+    ctx.stroke();
+    ctx.setLineDash([]);
 
     // pipes
     ctx.fillStyle = '#49c36b';
     pipes.forEach(p => {
-      ctx.fillRect(p.x - 30, 0, 60, p.top);
-      ctx.fillRect(p.x - 30, p.bottom, 60, h - p.bottom - 60);
+      ctx.fillRect(p.x - PIPE_HALF_W, 0, PIPE_HALF_W*2, p.top);
+      ctx.fillRect(p.x - PIPE_HALF_W, p.bottom, PIPE_HALF_W*2, h - p.bottom - 90);
     });
 
     // players (no spectators drawn)
@@ -184,14 +198,20 @@ function draw() {
       ctx.arc(BIRD_X, p.y, BIRD_RADIUS + 2, 0, Math.PI * 2);
       ctx.fill();
 
+      // name
       ctx.fillStyle = '#fff';
-      ctx.font = '14px system-ui, sans-serif';
-      const tag = `${p.name}${p.alive ? '' : ' ☠'}`;
-      ctx.fillText(tag, BIRD_X - 26, p.y - (BIRD_RADIUS + 8));
+      ctx.font = '18px system-ui, sans-serif';
+      const tag = `${p.name}`;
+      ctx.fillText(tag, BIRD_X - 30, p.y - (BIRD_RADIUS + 10));
 
-      ctx.fillStyle = '#b3ffd2';
-      ctx.font = 'bold 18px system-ui, sans-serif';
-      ctx.fillText(String(p.score), BIRD_X - 5, p.y + 6);
+      // progress bar under each player
+      const ratio = (p.progress || 0) / (finishPipes || 1);
+      const barW = 160, barH = 10, bx = BIRD_X - barW/2, by = p.y + BIRD_RADIUS + 14;
+      ctx.fillStyle = '#2a2e36';
+      ctx.fillRect(bx, by, barW, barH);
+      ctx.fillStyle = isMe ? '#b3ffd2' : '#9ab7ff';
+      ctx.fillRect(bx, by, Math.max(0, Math.min(barW, barW * ratio)), barH);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(bx, by, barW, barH);
     });
 
     // overlays
@@ -199,16 +219,19 @@ function draw() {
       ctx.fillStyle = 'rgba(0,0,0,0.35)';
       ctx.fillRect(0,0,w,h);
       ctx.fillStyle = '#ffffff';
-      ctx.font = '28px system-ui, sans-serif';
+      ctx.font = '36px system-ui, sans-serif';
       let msg = s.state.toUpperCase();
       if (s.state === 'countdown' && s.countdownEndsAt) {
         const secs = Math.max(0, Math.ceil((s.countdownEndsAt - (Date.now() + serverOffset))/1000));
         msg = secs > 0 ? String(secs) : 'GO!';
       }
       if (s.state === 'lobby') msg = 'Waiting for players… Ready up!';
-      if (s.state === 'gameover') msg = 'Round over — press R to restart';
+      if (s.state === 'gameover') {
+        const winner = s.players.find(p => p.id === s.winnerId);
+        msg = winner ? `${winner.name} wins!` : 'Round over';
+      }
       const textW = ctx.measureText(msg).width;
-      ctx.fillText(msg, (w - textW) / 2, h * 0.45);
+      ctx.fillText(msg, (w - textW) / 2, h * 0.42);
     }
   }
 
@@ -216,5 +239,5 @@ function draw() {
 }
 draw();
 
-// Auto-connect to lobby on load
+// Auto-connect default
 connect('lobby', 'Player');

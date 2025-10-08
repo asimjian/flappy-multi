@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Flappy Multi</title>
+  <title>Flappy Race</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./style.css" />
 </head>
@@ -20,7 +20,7 @@
     <div class="row info">
       <div>State: <span id="gameState">—</span></div>
       <div>Countdown: <span id="countdown">—</span></div>
-      <div>Score: <span id="score">0</span></div>
+      <div>Your Progress: <span id="progress">0</span>/<span id="finish">—</span></div>
     </div>
   </div>
 
@@ -33,7 +33,8 @@
   </div>
 
   <div class="canvas-wrap">
-    <canvas id="game" width="480" height="800"></canvas>
+    <!-- Logical 1920x1080; CSS scales it down responsively -->
+    <canvas id="game" width="1920" height="1080"></canvas>
   </div>
 
   <script src="./client.js" type="module"></script>

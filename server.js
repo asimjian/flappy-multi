@@ -1,4 +1,4 @@
-// server.js
+// server.js — Race mode: first to FINISH_PIPES wins; crash = respawn + progress reset.
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
@@ -6,20 +6,25 @@ import { v4 as uuidv4 } from 'uuid';
 
 const TICK_RATE = 60;          // physics tick
 const SNAP_RATE = 20;          // network snapshots
-const WIDTH = 480;             // logical world size
-const HEIGHT = 800;
+const WIDTH = 1920;            // widescreen logical world
+const HEIGHT = 1080;
 const GRAVITY = 0.5;
-const FLAP_VY = -8.0;
-const PIPE_SPEED = 2.6;
-const PIPE_GAP = 160;
-const PIPE_INTERVAL = 1600;    // ms
-const BIRD_X = 120;
-const BIRD_RADIUS = 12;
+const FLAP_VY = -9.0;
+const PIPE_SPEED = 3.8;
+const PIPE_GAP = 210;
+const PIPE_INTERVAL = 1400;    // ms
+const PIPE_HALF_W = 40;        // pipe half width (80px wide)
+const BIRD_X = 300;            // bird X for all players (world scrolls)
+const BIRD_RADIUS = 14;
 
 const MIN_PLAYERS = 2;                 // players required to start
 const COUNTDOWN_SECONDS = 3;           // 3..2..1..Go!
 const LOBBY_READY_REQUIRED = true;     // all players must ready up
 const MIN_FLAP_INTERVAL_MS = 120;      // anti-spam (server-side)
+
+// --- RACE SETTINGS ---
+const FINISH_PIPES = 15;               // "finish line": pass this many pipes from your personal start
+const RESPAWN_PENALTY_MS = 0;          // keep 0 for instant respawn; bump if you want delay
 
 const app = express();
 app.use(express.static('public'));
@@ -30,10 +35,12 @@ const wss = new WebSocketServer({ server: httpServer });
 /**
  * Room lifecycle:
  *   state: 'lobby' | 'countdown' | 'playing' | 'gameover'
- *   players: Map<id, { y, vy, alive, score, name, ready, spectator, lastFlapAt }>
- *   pipes: []
+ *   players: Map<id, { y, vy, name, ready, spectator, lastFlapAt, progress, startSeq, respawnAt }>
+ *   pipes: [{ x, top, bottom, id, seq, scoredIds:Set }]
  *   lastPipeAt
- *   countdownEndsAt: epoch ms when countdown hits 0
+ *   countdownEndsAt
+ *   nextPipeSeq
+ *   winnerId
  */
 const rooms = new Map();
 
@@ -44,6 +51,8 @@ function makeRoom(roomId) {
     pipes: [],
     lastPipeAt: 0,
     countdownEndsAt: null,
+    nextPipeSeq: 0,
+    winnerId: null,
   });
 }
 
@@ -52,58 +61,63 @@ function resetRound(room) {
   room.pipes.length = 0;
   room.lastPipeAt = 0;
   room.countdownEndsAt = null;
+  room.nextPipeSeq = 0;
+  room.winnerId = null;
   for (const [, p] of room.players) {
-    p.y = HEIGHT / 2;
-    p.vy = 0;
-    p.alive = true;
-    p.score = 0;
+    p.y = HEIGHT / 2; p.vy = 0;
     p.ready = false;
-    // spectators that joined mid-round become eligible to play next round
-    p.spectator = false;
+    p.spectator = false;               // spectators become eligible next round
+    p.progress = 0;
+    p.startSeq = 0;
+    p.respawnAt = 0;
   }
 }
 
 function addPipe(room) {
-  const margin = 120;
+  const margin = 200; // avoid extreme top/bottom
   const gapCenter = margin + Math.random() * (HEIGHT - margin * 2);
   const top = gapCenter - PIPE_GAP / 2;
   const bottom = gapCenter + PIPE_GAP / 2;
-  room.pipes.push({ x: WIDTH + 50, top, bottom, id: uuidv4(), scoredIds: new Set() });
+  room.pipes.push({
+    x: WIDTH + PIPE_HALF_W + 80,
+    top,
+    bottom,
+    id: uuidv4(),
+    seq: room.nextPipeSeq++,
+    scoredIds: new Set()
+  });
 }
 
-function anyAlive(room) {
-  for (const [, p] of room.players) if (p.alive && !p.spectator) return true;
-  return false;
-}
-
-function playingEligiblePlayers(room) {
+function eligiblePlayers(room) {
   return [...room.players.values()].filter(p => !p.spectator);
 }
-
 function canStartCountdown(room) {
-  const candidates = playingEligiblePlayers(room);
-  if (candidates.length < MIN_PLAYERS) return false;
+  const cand = eligiblePlayers(room);
+  if (cand.length < MIN_PLAYERS) return false;
   if (!LOBBY_READY_REQUIRED) return true;
-  return candidates.every(p => p.ready);
+  return cand.every(p => p.ready);
 }
-
 function startCountdown(room) {
   room.state = 'countdown';
   room.countdownEndsAt = Date.now() + COUNTDOWN_SECONDS * 1000;
 }
-
 function startPlaying(room) {
   room.state = 'playing';
   room.pipes.length = 0;
   room.lastPipeAt = Date.now();
+  room.nextPipeSeq = 0;
   addPipe(room);
+  for (const [, p] of room.players) {
+    p.progress = 0;
+    p.startSeq = room.nextPipeSeq; // first pipe after start is seq at this time
+    p.respawnAt = 0;
+    // keep spectators as spectators
+  }
 }
 
 function stepRoom(room) {
   // Lobby logic
-  if (room.state === 'lobby' && canStartCountdown(room)) {
-    startCountdown(room);
-  }
+  if (room.state === 'lobby' && canStartCountdown(room)) startCountdown(room);
 
   // Countdown -> Playing
   if (room.state === 'countdown') {
@@ -120,64 +134,90 @@ function stepRoom(room) {
 
   // Move pipes
   for (const p of room.pipes) p.x -= PIPE_SPEED;
-  while (room.pipes.length && room.pipes[0].x < -80) room.pipes.shift();
+  while (room.pipes.length && room.pipes[0].x < -PIPE_HALF_W - 100) room.pipes.shift();
 
-  // Update players
+  // Update players (no elimination; crash => respawn + progress reset)
+  const now = Date.now();
   for (const [, pl] of room.players) {
-    if (!pl.alive || pl.spectator) continue;
+    if (pl.spectator) continue;
+
+    // respawn freeze (optional)
+    if (pl.respawnAt && now < pl.respawnAt) continue;
+
     pl.vy += GRAVITY;
     pl.y += pl.vy;
-    if (pl.y < BIRD_RADIUS) { pl.y = BIRD_RADIUS; pl.vy = 0; }
-    if (pl.y > HEIGHT - BIRD_RADIUS) { pl.y = HEIGHT - BIRD_RADIUS; pl.alive = false; }
 
-    // Collisions & scoring
+    if (pl.y < BIRD_RADIUS) { pl.y = BIRD_RADIUS; pl.vy = 0; }
+    if (pl.y > HEIGHT - BIRD_RADIUS) {
+      // "crash" on ground => respawn
+      onCrash(room, pl);
+      continue;
+    }
+
+    // Pipe collisions & scoring
     for (const p of room.pipes) {
-      const inPipeX = (p.x - 30) < BIRD_X && BIRD_X < (p.x + 30);
+      const inPipeX = (p.x - PIPE_HALF_W) < BIRD_X && BIRD_X < (p.x + PIPE_HALF_W);
       if (inPipeX) {
         if (pl.y - BIRD_RADIUS < p.top || pl.y + BIRD_RADIUS > p.bottom) {
-          pl.alive = false;
+          onCrash(room, pl);
           break;
         }
       }
-      // Score once per player per pipe
-      if (p.x + 30 < BIRD_X && !p.scoredIds.has(pl)) {
+      // Score once per pipe per player — only for pipes after player's personal start
+      if (p.x + PIPE_HALF_W < BIRD_X && !p.scoredIds.has(pl) && p.seq >= pl.startSeq) {
         p.scoredIds.add(pl);
-        if (pl.alive) pl.score += 1;
+        pl.progress += 1;
+        if (pl.progress >= FINISH_PIPES && !room.winnerId) {
+          room.winnerId = getPlayerId(room, pl);
+          room.state = 'gameover';
+          setTimeout(() => resetRound(room), 3500);
+        }
       }
     }
   }
+}
 
-  // End of round if no eligible players alive
-  if (!anyAlive(room)) {
-    room.state = 'gameover';
-    setTimeout(() => resetRound(room), 3000);
-  }
+function onCrash(room, pl) {
+  pl.y = HEIGHT / 2;
+  pl.vy = 0;
+  pl.progress = 0;
+  // reset “start line” to NEXT pipes generated after now
+  pl.startSeq = room.nextPipeSeq;
+  pl.respawnAt = RESPAWN_PENALTY_MS ? Date.now() + RESPAWN_PENALTY_MS : 0;
+}
+
+function getPlayerId(room, playerObj) {
+  for (const [id, p] of room.players.entries()) if (p === playerObj) return id;
+  return null;
 }
 
 function snapshot(room) {
   const players = [...room.players.entries()].map(([id, pl]) => ({
-    id, y: pl.y, vy: pl.vy, alive: pl.alive, score: pl.score,
-    name: pl.name ?? 'Player', ready: !!pl.ready, spectator: !!pl.spectator
+    id, y: pl.y, vy: pl.vy, name: pl.name ?? 'Player',
+    ready: !!pl.ready, spectator: !!pl.spectator,
+    progress: pl.progress
   }));
-  const eligible = players.filter(p => !p.spectator);
-  const readyCount = eligible.filter(p => p.ready).length;
+  const elig = players.filter(p => !p.spectator);
+  const readyCount = elig.filter(p => p.ready).length;
 
   return {
     type: 'state',
     serverTime: Date.now(),
     state: room.state,
     countdownEndsAt: room.countdownEndsAt,
+    winnerId: room.winnerId,
     w: WIDTH,
     h: HEIGHT,
-    pipes: room.pipes.map(p => ({ x: p.x, top: p.top, bottom: p.bottom, id: p.id })),
+    finishPipes: FINISH_PIPES,
+    pipes: room.pipes.map(p => ({ x: p.x, top: p.top, bottom: p.bottom, id: p.id, seq: p.seq })),
     players,
     meta: {
-      playerCount: eligible.length,
-      spectatorCount: players.length - eligible.length,
+      players: elig.length,
+      spectators: players.length - elig.length,
       readyCount,
       minPlayers: MIN_PLAYERS
     },
-    constants: { BIRD_X, BIRD_RADIUS }
+    constants: { BIRD_X, BIRD_RADIUS, PIPE_HALF_W }
   };
 }
 
@@ -188,11 +228,14 @@ function joinRoom(ws, roomId, name) {
   const joiningDuringRound = room.state === 'playing';
 
   room.players.set(id, {
-    y: HEIGHT / 2, vy: 0, alive: !joiningDuringRound, score: 0,
+    y: HEIGHT / 2, vy: 0,
     name: (name || 'Player').slice(0, 16),
     ready: false,
-    spectator: joiningDuringRound,     // <- spectator if join mid-round
-    lastFlapAt: 0
+    spectator: joiningDuringRound,     // spectators if mid-round
+    lastFlapAt: 0,
+    progress: 0,
+    startSeq: joiningDuringRound ? room.nextPipeSeq : 0,
+    respawnAt: 0
   });
   ws._playerId = id;
   ws._roomId = roomId;
@@ -206,9 +249,7 @@ function leaveRoom(ws) {
   if (!roomId || !rooms.has(roomId)) return;
   const room = rooms.get(roomId);
   room.players.delete(id);
-  if (room.players.size === 0) {
-    rooms.delete(roomId);
-  }
+  if (room.players.size === 0) rooms.delete(roomId);
 }
 
 wss.on('connection', (ws) => {
@@ -216,7 +257,6 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // Initial join
     if (msg.type === 'join') {
       joinRoom(ws, (msg.roomId || 'lobby').toString().slice(0, 24), (msg.name || '').toString());
       return;
@@ -230,11 +270,12 @@ wss.on('connection', (ws) => {
     if (msg.type === 'ready' && room.state === 'lobby' && !pl.spectator) {
       pl.ready = !!msg.ready;
     }
-    if (msg.type === 'flap' && room.state === 'playing' && pl.alive && !pl.spectator) {
+    if (msg.type === 'flap' && room.state === 'playing' && !pl.spectator) {
       const now = Date.now();
       if (now - (pl.lastFlapAt || 0) >= MIN_FLAP_INTERVAL_MS) {
+        // allow flaps even immediately after respawn
         pl.vy = FLAP_VY;
-        pl.lastFlapAt = now; // anti-spam
+        pl.lastFlapAt = now;
       }
     }
     if (msg.type === 'restart') {
@@ -245,48 +286,40 @@ wss.on('connection', (ws) => {
   ws.on('close', () => leaveRoom(ws));
 });
 
-// Loops
+// Game & snapshot loops
 setInterval(() => { for (const room of rooms.values()) stepRoom(room); }, 1000 / TICK_RATE);
 
 setInterval(() => {
-  const snapStrByRoom = new Map();
+  const byRoom = new Map();
   for (const [roomId, room] of rooms.entries()) {
-    const snapStr = JSON.stringify(snapshot(room));
-    snapStrByRoom.set(roomId, snapStr);
+    byRoom.set(roomId, JSON.stringify(snapshot(room)));
   }
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
-    const rid = client._roomId;
-    const snap = snapStrByRoom.get(rid);
+    const snap = byRoom.get(client._roomId);
     if (snap) client.send(snap);
   }
 }, 1000 / SNAP_RATE);
 
-// -------- Room browser (REST) ----------
+// ---- Room browser REST ----
 function roomsList() {
   const list = [];
   for (const [id, room] of rooms.entries()) {
-    const players = [...room.players.values()];
-    const spectators = players.filter(p => p.spectator).length;
-    const eligible = players.length - spectators;
-    const ready = players.filter(p => p.ready && !p.spectator).length;
+    const ps = [...room.players.values()];
+    const specs = ps.filter(p => p.spectator).length;
     list.push({
       id,
       state: room.state,
-      players: eligible,
-      spectators,
-      ready,
+      players: ps.length - specs,
+      spectators: specs,
+      ready: ps.filter(p => p.ready && !p.spectator).length,
       minPlayers: MIN_PLAYERS
     });
   }
-  // Stable order: active rooms first, then by id
-  list.sort((a, b) => (a.state === 'lobby' ? -1 : 1) - (b.state === 'lobby' ? -1 : 1) || a.id.localeCompare(b.id));
+  list.sort((a,b) => (a.state === 'lobby' ? -1 : 1) - (b.state === 'lobby' ? -1 : 1) || a.id.localeCompare(b.id));
   return list;
 }
-
-app.get('/rooms', (_req, res) => {
-  res.json({ rooms: roomsList() });
-});
+app.get('/rooms', (_req, res) => res.json({ rooms: roomsList() }));
 
 // ---------------------------------------
 const PORT = process.env.PORT || 3000;
