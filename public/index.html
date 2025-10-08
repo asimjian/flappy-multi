@@ -8,18 +8,34 @@
 </head>
 <body>
   <div class="hud">
-    <div>
+    <div class="row">
       <label>Room:</label>
       <input id="room" value="lobby" />
       <label>Name:</label>
       <input id="name" value="Player" />
       <button id="joinBtn">Join</button>
-      <span id="status">disconnected</span>
+      <button id="readyBtn">Ready</button>
+      <span id="status" class="status">disconnected</span>
     </div>
-    <div>Score: <span id="score">0</span></div>
-    <div class="hint">Press Space / Click / Tap to flap. R to restart.</div>
+    <div class="row info">
+      <div>State: <span id="gameState">—</span></div>
+      <div>Countdown: <span id="countdown">—</span></div>
+      <div>Score: <span id="score">0</span></div>
+    </div>
   </div>
-  <canvas id="game" width="400" height="600"></canvas>
+
+  <div class="browser">
+    <div class="browser-header">
+      <strong>Rooms</strong>
+      <button id="refreshRooms">Refresh</button>
+    </div>
+    <div id="roomsList" class="rooms-list">Loading…</div>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="game" width="480" height="800"></canvas>
+  </div>
+
   <script src="./client.js" type="module"></script>
 </body>
 </html>
